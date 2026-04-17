@@ -1,6 +1,26 @@
 name: CI/CD Pipeline
 
 on:
+  workflow_dispatch:     # 👈 添加手动触发
+    inputs:
+      environment:
+        description: '部署环境'
+        required: false
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      skip_lint:
+        description: '跳过代码检查'
+        required: false
+        type: boolean
+        default: false
+      skip_security:
+        description: '跳过安全扫描'
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [main, develop]
     tags: ['v*.*.*']
@@ -19,6 +39,9 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'workflow_dispatch' || 
+      (github.event_name == 'workflow_dispatch' && inputs.skip_lint != true)
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -53,13 +76,29 @@ jobs:
   build-and-push:
     needs: lint
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    if: github.event_name != 'pull_request'
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Setup Node.js for build
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm build
+        env:
+          NODE_ENV: production
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -159,6 +198,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=manual-${{ github.event_name == 'workflow_dispatch' && github.run_number || '' }},enable=${{ github.event_name == 'workflow_dispatch' }}
             type=sha,prefix={{branch}}-
 
       - name: Build and push Docker image
@@ -172,7 +212,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
-            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}
             VCS_REF=${{ github.sha }}
             VERSION=${{ steps.meta.outputs.version }}
             OKI_INITIAL_VIDEO_SOURCES=${{ env.OKI_INITIAL_VIDEO_SOURCES }}
@@ -184,7 +224,10 @@ jobs:
   security-scan:
     needs: build-and-push
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: |
+      github.event_name == 'push' && 
+      github.ref == 'refs/heads/main' &&
+      (github.event_name != 'workflow_dispatch' || inputs.skip_security != true)
     permissions:
       contents: read
       packages: read
@@ -211,12 +254,12 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@v0.35.0
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: 'ghcr.io/${{ steps.ghcr-owner.outputs.value }}/${{ env.IMAGE_NAME }}:latest'
           format: 'sarif'
           output: 'trivy-results.sarif'
-          version: 'v0.69.3'
+          version: '0.56.0'
           token-setup-trivy: ${{ secrets.GITHUB_TOKEN }}
         env:
           TRIVY_USERNAME: ${{ github.actor }}
